@@ -1,55 +1,96 @@
 import fs from 'fs/promises';
 import path from 'path';
-import fetch from 'node-fetch';
 import { ensureUserDirs, sanitizeName } from '../utils/fileHelpers.js';
+import { DownloadManager } from '../utils/downloadManager.js';
+import { Logger } from '../utils/logger.js';
+import { jobManager } from '../utils/jobManager.js';
+import archiver from 'archiver';
 
 export default async function archiveRoutes(fastify, opts) {
   const { dataDir } = opts;
 
   fastify.post('/run', async (req, reply) => {
-    const { username, cookie } = req.body;
+    const { username, cookie, limit, rateLimitMs } = req.body;
     if (!cookie || !username)
       return reply.code(400).send({ error: 'Missing username or cookie' });
 
     const user = sanitizeName(username);
     const { baseDir, libPath, dlDir } = await ensureUserDirs(dataDir, user);
 
-    // Load existing library JSON
-    let oldLib = [];
-    try {
-      oldLib = JSON.parse(await fs.readFile(libPath, 'utf8'));
-    } catch {}
+    // Initialize job tracking
+    jobManager.create(user);
 
-    const oldIds = new Set(oldLib.map(i => i.id));
-
-    // Fetch latest library from Suno
-    const res = await fetch('https://suno.com/api/library?limit=9999', {
-      headers: { Cookie: cookie },
+    // Initialize logger
+    const logger = new Logger({
+      dataDir,
+      username: user,
+      fastifyLogger: fastify.log
     });
-    if (!res.ok) return reply.code(res.status).send({ error: 'Failed to fetch library' });
-    const lib = await res.json();
+    await logger.init();
 
-    const newItems = lib.items.filter(i => !oldIds.has(i.id));
-    let downloaded = 0;
+    try {
+      // Initialize download manager
+      const dm = new DownloadManager({
+        dataDir,
+        username: user,
+        cookie,
+        logger,
+        concurrency: 3,
+        maxRetries: 3,
+        rateLimitMs: rateLimitMs || 1000 // Default 1 second between downloads
+      });
 
-    for (const item of newItems) {
-      if (!item.audio_url) continue;
-      const fileName = `${item.id}.mp3`;
-      const outPath = path.join(dlDir, fileName);
+      // Load existing library JSON
+      let oldLib = [];
+      try {
+        oldLib = JSON.parse(await fs.readFile(libPath, 'utf8'));
+      } catch {}
 
-      const audio = await fetch(item.audio_url, { headers: { Cookie: cookie } });
-      if (!audio.ok) continue;
+      const oldIds = new Set(oldLib.map(i => i.id));
 
-      const buf = Buffer.from(await audio.arrayBuffer());
-      await fs.writeFile(outPath, buf);
-      downloaded++;
-      fastify.log.info(`[${user}] downloaded ${fileName}`);
+      // Fetch latest library from Suno
+      const lib = await dm.fetchLibrary();
+
+      let newItems = lib.items.filter(i => !oldIds.has(i.id));
+
+      // Apply limit if specified (for testing)
+      if (limit && limit > 0) {
+        newItems = newItems.slice(0, limit);
+        await logger.info(`Limiting download to ${limit} items for testing`);
+      }
+
+      dm.progress.total = newItems.length;
+
+      await logger.info(`Found ${newItems.length} new items to download`);
+
+      // Download all new items with concurrency control
+      if (newItems.length > 0) {
+        await dm.downloadBatch(newItems, dlDir);
+      }
+
+      // Merge and save library
+      const merged = [...oldLib, ...newItems];
+      await fs.writeFile(libPath, JSON.stringify(merged, null, 2));
+      await logger.info(`Library updated: ${merged.length} total items`);
+
+      // Complete job
+      const stats = dm.getProgress();
+      await logger.complete(stats);
+      jobManager.complete(user, stats);
+
+      return {
+        user,
+        downloaded: stats.downloaded,
+        failed: stats.failed,
+        skipped: stats.skipped,
+        total: merged.length,
+        errors: dm.getErrors()
+      };
+    } catch (err) {
+      await logger.error(`Archive failed: ${err.message}`);
+      jobManager.fail(user, err.message);
+      return reply.code(500).send({ error: err.message });
     }
-
-    const merged = [...oldLib, ...newItems];
-    await fs.writeFile(libPath, JSON.stringify(merged, null, 2));
-
-    return { user, downloaded, total: merged.length };
   });
 
   // Return current user library metadata
@@ -60,7 +101,45 @@ export default async function archiveRoutes(fastify, opts) {
       const json = await fs.readFile(libPath, 'utf8');
       return JSON.parse(json);
     } catch {
-      return { error: 'No library found' };
+      return reply.code(404).send({ error: 'No library found' });
     }
+  });
+
+  // Get job status
+  fastify.get('/status/:username', async (req, reply) => {
+    const user = sanitizeName(req.params.username);
+    const job = jobManager.get(user);
+
+    if (!job) {
+      return reply.code(404).send({ error: 'No job found for this user' });
+    }
+
+    return job;
+  });
+
+  // Export user archive as ZIP
+  fastify.post('/export/:username', async (req, reply) => {
+    const user = sanitizeName(req.params.username);
+    const userDir = path.join(dataDir, user);
+
+    try {
+      await fs.access(userDir);
+    } catch {
+      return reply.code(404).send({ error: 'User archive not found' });
+    }
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+
+    archive.on('error', (err) => {
+      fastify.log.error(`Archive error for ${user}: ${err.message}`);
+      reply.code(500).send({ error: 'Failed to create archive' });
+    });
+
+    reply.header('Content-Type', 'application/zip');
+    reply.header('Content-Disposition', `attachment; filename="${user}-archive.zip"`);
+    reply.send(archive);
+
+    archive.directory(userDir, false);
+    archive.finalize();
   });
 }

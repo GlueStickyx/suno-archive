@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import path from 'path';
-import fastifyStatic from 'fastify-static';
+import fastifyStatic from '@fastify/static';
 import dotenv from 'dotenv';
 import archiveRoutes from './routes/archive.js';
 

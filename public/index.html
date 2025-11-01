@@ -2,37 +2,195 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Suno Archive Tool</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <h1>Suno Archive Tool</h1>
-  <form id="archive-form">
-    <input name="username" placeholder="Username" required />
-    <textarea name="cookie" placeholder="Paste your full Suno cookie..." required></textarea>
-    <button type="submit">Run Archive</button>
-  </form>
+  <div class="container">
+    <header>
+      <h1>🎵 Suno Archive Tool</h1>
+      <p class="subtitle">Backup and preserve your Suno creations</p>
+    </header>
 
-  <pre id="output"></pre>
+    <div class="card">
+      <form id="archive-form">
+        <div class="form-group">
+          <label for="username">Username</label>
+          <input id="username" name="username" placeholder="your-username" required />
+        </div>
+
+        <div class="form-group">
+          <label for="cookie">Suno Cookie</label>
+          <textarea id="cookie" name="cookie" placeholder="Paste your full Suno cookie here..." required></textarea>
+          <small class="help-text">Your cookie is never stored and only used for this request</small>
+        </div>
+
+        <div class="form-group">
+          <label for="limit">Download Limit (optional)</label>
+          <input id="limit" name="limit" type="number" min="1" placeholder="Leave empty for all, or enter a number (e.g., 5)" />
+          <small class="help-text">For testing: limit how many new songs to download</small>
+        </div>
+
+        <button type="submit" id="submit-btn">
+          <span class="btn-text">Start Archive</span>
+        </button>
+      </form>
+    </div>
+
+    <div id="status-section" class="hidden">
+      <div class="card">
+        <h3>Archive Status</h3>
+        <div id="progress-bar" class="progress-bar">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+        <div id="status-text" class="status-text"></div>
+      </div>
+    </div>
+
+    <div id="result-section" class="hidden">
+      <div class="card">
+        <h3>Results</h3>
+        <div id="results" class="results"></div>
+        <div id="actions" class="actions">
+          <button id="view-library-btn" class="btn-secondary">View Library</button>
+          <button id="export-btn" class="btn-secondary">Export ZIP</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="library-section" class="hidden">
+      <div class="card">
+        <h3>Library</h3>
+        <div id="library-content"></div>
+      </div>
+    </div>
+  </div>
 
   <script>
     const form = document.getElementById('archive-form');
-    const output = document.getElementById('output');
+    const submitBtn = document.getElementById('submit-btn');
+    const statusSection = document.getElementById('status-section');
+    const resultSection = document.getElementById('result-section');
+    const librarySection = document.getElementById('library-section');
+    const statusText = document.getElementById('status-text');
+    const results = document.getElementById('results');
+    const progressFill = document.getElementById('progress-fill');
+
+    let currentUsername = null;
 
     form.addEventListener('submit', async e => {
       e.preventDefault();
-      output.textContent = "Running...\n";
-      const username = form.username.value;
-      const cookie = form.cookie.value;
 
-      const res = await fetch('/api/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, cookie })
-      });
+      const username = form.username.value.trim();
+      const cookie = form.cookie.value.trim();
+      const limit = form.limit.value ? parseInt(form.limit.value) : null;
+      currentUsername = username;
 
-      const data = await res.json();
-      output.textContent = JSON.stringify(data, null, 2);
+      // Reset UI
+      resultSection.classList.add('hidden');
+      librarySection.classList.add('hidden');
+      statusSection.classList.remove('hidden');
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span class="btn-text">Running...</span>';
+
+      statusText.textContent = limit
+        ? `🔄 Starting archive (testing with ${limit} songs)...`
+        : '🔄 Starting archive...';
+      progressFill.style.width = '0%';
+
+      try {
+        const payload = { username, cookie };
+        if (limit) payload.limit = limit;
+
+        const res = await fetch('/api/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+
+        if (res.ok) {
+          showResults(data);
+        } else {
+          showError(data.error || 'Archive failed');
+        }
+      } catch (err) {
+        showError(err.message);
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<span class="btn-text">Start Archive</span>';
+      }
+    });
+
+    function showResults(data) {
+      progressFill.style.width = '100%';
+      statusText.textContent = '✅ Archive complete!';
+
+      resultSection.classList.remove('hidden');
+
+      let html = `
+        <div class="result-grid">
+          <div class="stat">
+            <div class="stat-value">${data.downloaded}</div>
+            <div class="stat-label">Downloaded</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value">${data.total}</div>
+            <div class="stat-label">Total</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value">${data.failed || 0}</div>
+            <div class="stat-label">Failed</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value">${data.skipped || 0}</div>
+            <div class="stat-label">Skipped</div>
+          </div>
+        </div>
+      `;
+
+      if (data.errors && data.errors.length > 0) {
+        html += '<div class="errors"><h4>Errors:</h4><ul>';
+        data.errors.forEach(err => {
+          html += `<li>${err.id}: ${err.error}</li>`;
+        });
+        html += '</ul></div>';
+      }
+
+      results.innerHTML = html;
+    }
+
+    function showError(message) {
+      statusSection.classList.add('hidden');
+      resultSection.classList.remove('hidden');
+      results.innerHTML = `<div class="error">❌ ${message}</div>`;
+    }
+
+    document.getElementById('view-library-btn').addEventListener('click', async () => {
+      if (!currentUsername) return;
+
+      try {
+        const res = await fetch(`/api/library/${currentUsername}`);
+        const data = await res.json();
+
+        if (data.error) {
+          alert(data.error);
+          return;
+        }
+
+        librarySection.classList.remove('hidden');
+        document.getElementById('library-content').innerHTML =
+          `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+      } catch (err) {
+        alert('Failed to load library: ' + err.message);
+      }
+    });
+
+    document.getElementById('export-btn').addEventListener('click', async () => {
+      if (!currentUsername) return;
+      window.location.href = `/api/export/${currentUsername}`;
     });
   </script>
 </body>
