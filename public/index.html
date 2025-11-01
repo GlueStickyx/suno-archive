@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Suno Archive Tool</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <h1>Suno Archive Tool</h1>
+  <form id="archive-form">
+    <input name="username" placeholder="Username" required />
+    <textarea name="cookie" placeholder="Paste your full Suno cookie..." required></textarea>
+    <button type="submit">Run Archive</button>
+  </form>
+
+  <pre id="output"></pre>
+
+  <script>
+    const form = document.getElementById('archive-form');
+    const output = document.getElementById('output');
+
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      output.textContent = "Running...\n";
+      const username = form.username.value;
+      const cookie = form.cookie.value;
+
+      const res = await fetch('/api/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, cookie })
+      });
+
+      const data = await res.json();
+      output.textContent = JSON.stringify(data, null, 2);
+    });
+  </script>
+</body>
+</html>
