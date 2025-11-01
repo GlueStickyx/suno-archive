@@ -3,7 +3,7 @@ import path from 'path';
 import fetch from 'node-fetch';
 
 export class DownloadManager {
-  constructor({ dataDir, username, cookie, logger, concurrency = 3, maxRetries = 3, rateLimitMs = 1000, limit = null, format = 'mp3' }) {
+  constructor({ dataDir, username, cookie, logger, concurrency = 3, maxRetries = 3, rateLimitMs = 1000, limit = null, format = 'mp3', existingIds = new Set() }) {
     this.dataDir = dataDir;
     this.username = username;
     this.cookie = cookie;
@@ -13,6 +13,7 @@ export class DownloadManager {
     this.rateLimitMs = rateLimitMs; // Delay between downloads to respect rate limits
     this.limit = limit; // Optional limit for testing
     this.format = format; // 'mp3', 'wav', or 'both'
+    this.existingIds = existingIds; // Set of existing IDs for smart pagination
 
     this.progress = {
       total: 0,
@@ -31,6 +32,8 @@ export class DownloadManager {
     let allItems = [];
     let page = 0;
     let hasMore = true;
+    let consecutiveExistingPages = 0;
+    const EARLY_STOP_THRESHOLD = 2; // Stop after 2 consecutive pages of all-existing content
 
     // Calculate max pages needed if limit is set (20 items per page)
     const maxPages = this.limit ? Math.ceil(this.limit / 20) : Infinity;
@@ -68,6 +71,24 @@ export class DownloadManager {
         // Log first clip structure on first page for debugging
         if (page === 0 && clips.length > 0) {
           this.logger.info(`[${this.username}] Sample clip fields: ${Object.keys(clips[0]).join(', ')}`);
+        }
+
+        // Smart pagination: check if all clips on this page already exist
+        if (this.existingIds.size > 0) {
+          const newClipsOnPage = clips.filter(c => !this.existingIds.has(c.id)).length;
+
+          if (newClipsOnPage === 0) {
+            consecutiveExistingPages++;
+            this.logger.info(`[${this.username}] Page ${page} contains all existing content (${consecutiveExistingPages}/${EARLY_STOP_THRESHOLD} consecutive)`);
+
+            if (consecutiveExistingPages >= EARLY_STOP_THRESHOLD) {
+              this.logger.info(`[${this.username}] Early stop: ${EARLY_STOP_THRESHOLD} consecutive pages of existing content`);
+              hasMore = false;
+            }
+          } else {
+            consecutiveExistingPages = 0; // Reset counter if we find new content
+            this.logger.info(`[${this.username}] Page ${page} contains ${newClipsOnPage} new items`);
+          }
         }
 
         page++;

@@ -53,6 +53,9 @@ export default async function archiveRoutes(fastify, opts) {
       // Get existing clip IDs from database
       const oldIds = new Set(db.getAllIds());
 
+      // Pass existing IDs to enable smart pagination
+      dm.existingIds = oldIds;
+
       // Fetch latest library from Suno
       const lib = await dm.fetchLibrary();
 

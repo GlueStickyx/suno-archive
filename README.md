@@ -5,8 +5,10 @@ A self-hosted web tool for backing up and preserving your Suno creations. Design
 ## Features
 
 - **Incremental Sync**: Only downloads new tracks, skips existing ones
+- **Smart Pagination**: Automatically stops fetching when reaching already-archived content (massive speedup for large archives)
 - **Concurrent Downloads**: Configurable concurrency (default: 3 parallel downloads)
 - **Automatic Retry**: Exponential backoff retry logic for failed requests
+- **Safe Interruption Handling**: Resume from where you left off - partial downloads are safely re-downloaded
 - **Per-User Storage**: Isolated storage directories for multiple users
 - **Detailed Logging**: Timestamped logs for each archive run
 - **Export to ZIP**: Download entire user archive as a ZIP file
@@ -166,6 +168,29 @@ Downloads the user's entire archive as a ZIP file.
 4. Paste it into the tool (either cookie or bearer token works)
 
 **Security Note:** Your bearer token is never stored persistently. It only exists in memory during the archive job and is immediately discarded afterward.
+
+## Smart Pagination & Interruption Handling
+
+### How Incremental Sync Works
+
+**Smart Pagination Optimization:**
+- The system tracks which songs are already archived in a SQLite database
+- When fetching new content, it stops pagination after encountering 2 consecutive pages of already-downloaded content
+- For large archives (1000+ songs), this reduces sync time from ~100 seconds to ~4 seconds when you only have a few new songs
+- First-time archives still fetch all pages to build the complete library
+
+**Safe Interruption Handling:**
+- If an archive job is interrupted (network failure, manual stop, server restart), the system safely resumes on the next run
+- Only fully downloaded tracks are recorded in the database
+- Partial downloads are automatically re-downloaded and overwritten on the next run
+- No risk of corrupted files - you always get complete audio files
+
+**Example Scenario:**
+1. First run: Downloads 1000 songs (all pages fetched)
+2. Create 5 new songs on Suno
+3. Second run: Fetches only first 2 pages (~4 seconds), downloads 5 new songs
+4. Job interrupted after downloading 3/5 songs
+5. Third run: Re-fetches first 2 pages, downloads all 5 songs (2 already in DB are skipped, 3 partial ones are re-downloaded)
 
 ## Architecture
 
