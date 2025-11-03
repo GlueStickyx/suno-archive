@@ -12,7 +12,7 @@ export default async function archiveRoutes(fastify, opts) {
   const { dataDir } = opts;
 
   fastify.post('/run', async (req, reply) => {
-    const { username, cookie, limit, rateLimitMs, format } = req.body;
+    const { username, cookie, limit, rateLimitMs, format, fullSync, verifyFiles } = req.body;
     if (!cookie || !username)
       return reply.code(400).send({ error: 'Missing username or token' });
 
@@ -40,6 +40,19 @@ export default async function archiveRoutes(fastify, opts) {
       // Get existing clip IDs from database
       const oldIds = new Set(db.getAllIds());
 
+      // Auto-enable fullSync on first run (empty database)
+      const shouldFullSync = fullSync || oldIds.size === 0;
+
+      if (shouldFullSync && oldIds.size === 0) {
+        await logger.info('First run detected: full sync mode enabled automatically');
+      } else if (shouldFullSync) {
+        await logger.info('Full sync mode enabled: fetching all pages');
+      }
+
+      if (verifyFiles) {
+        await logger.info('Verify files mode enabled: checking filesystem for existing files');
+      }
+
       // Initialize download manager
       const dm = new DownloadManager({
         dataDir,
@@ -52,7 +65,10 @@ export default async function archiveRoutes(fastify, opts) {
         limit: limit || null, // Pass limit to control page fetching
         format: format || 'mp3', // Default to mp3 if not specified
         existingIds: oldIds,
-        db: db // Pass database for incremental writes
+        db: db, // Pass database for incremental writes
+        fullSync: shouldFullSync, // Enable full sync on first run or manual override
+        verifyFiles: verifyFiles || false, // Enable filesystem verification if requested
+        dlDir: dlDir // Pass download directory for file checks
       });
 
       // Fetch latest library from Suno
