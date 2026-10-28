@@ -185,7 +185,9 @@
 
     function showResults(data) {
       progressFill.style.width = '100%';
-      statusText.textContent = '✅ Archive complete!';
+      statusText.textContent = data.complete === false
+        ? '⚠️ Stopped before the end of your library - run again to continue'
+        : '✅ Archive complete!';
 
       resultSection.classList.remove('hidden');
 
@@ -209,6 +211,10 @@
           </div>
         </div>
       `;
+
+      if (data.stillFailing > 0) {
+        html += `<div class="error">⚠️ ${data.stillFailing} songs still failing. They are retried automatically on every run.</div>`;
+      }
 
       if (data.errors && data.errors.length > 0) {
         html += '<div class="errors"><h4>Errors:</h4><ul>';

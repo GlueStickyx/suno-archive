@@ -46,11 +46,21 @@ export default async function archiveRoutes(fastify, opts) {
       // Get existing clip IDs from database
       const oldIds = new Set(db.getAllIds());
 
-      // Auto-enable fullSync on first run (empty database)
-      const shouldFullSync = fullSync || oldIds.size === 0;
+      // Smart pagination is only safe if the previous run reached the end of
+      // the library. Databases from older versions have no flag, so they get a
+      // full sync once to pick up anything an interrupted run left behind.
+      const lastSyncComplete = db.getMeta('sync_complete') === '1';
+      const resumePage = parseInt(db.getMeta('resume_page')) || 0;
+      const shouldFullSync = fullSync || verifyFiles || oldIds.size === 0 || !lastSyncComplete;
 
-      if (shouldFullSync && oldIds.size === 0) {
+      // Resume an unfinished sync a couple of pages early, in case songs
+      // were deleted and shifted the pages since then
+      const startPage = !lastSyncComplete && resumePage > 0 ? Math.max(0, resumePage - 2) : 0;
+
+      if (oldIds.size === 0) {
         await logger.info('First run detected: full sync mode enabled automatically');
+      } else if (!lastSyncComplete) {
+        await logger.info(`Previous run did not reach the end of the library: full sync enabled, resuming at page ${startPage}`);
       } else if (shouldFullSync) {
         await logger.info('Full sync mode enabled: fetching all pages');
       }
@@ -68,38 +78,44 @@ export default async function archiveRoutes(fastify, opts) {
         concurrency: effectiveConcurrency,
         maxRetries: effectiveMaxRetries,
         rateLimitMs: effectiveRateLimit,
-        limit: limit || null, // Pass limit to control page fetching
+        limit: limit || null, // Stop after this many downloads (testing)
         format: effectiveFormat,
         existingIds: oldIds,
         db: db, // Pass database for incremental writes
-        fullSync: shouldFullSync, // Enable full sync on first run or manual override
+        fullSync: shouldFullSync,
         verifyFiles: verifyFiles || false, // Enable filesystem verification if requested
         dlDir: dlDir // Pass download directory for file checks
       });
 
-      // Fetch latest library from Suno
-      const lib = await dm.fetchLibrary();
-
-      let newItems = lib.items.filter(i => !oldIds.has(i.id));
-
-      // Apply limit if specified (for testing)
-      if (limit && limit > 0) {
-        newItems = newItems.slice(0, limit);
-        await logger.info(`Limiting download to ${limit} items for testing`);
+      if (verifyFiles) {
+        await dm.indexFilesOnDisk();
       }
 
-      dm.progress.total = newItems.length;
+      // Mark the sync as in progress until it reaches the end of the library
+      db.setMeta('sync_complete', '0');
+      db.setMeta('resume_page', startPage);
 
-      await logger.info(`Found ${newItems.length} new items to download`);
+      // Retry anything that failed in earlier runs
+      await dm.retryFailed(db.getFailed());
 
-      // Download all new items with concurrency control
-      // Database writes happen incrementally during downloads
-      if (newItems.length > 0) {
-        await dm.downloadBatch(newItems, dlDir);
+      // Fetch the library page by page, downloading as we go.
+      // Database writes happen incrementally during downloads.
+      const result = await dm.syncLibrary({
+        startPage,
+        onPage: nextPage => db.setMeta('resume_page', nextPage)
+      });
+
+      if (result.reachedEnd) {
+        db.setMeta('sync_complete', '1');
+        db.setMeta('resume_page', null);
       }
 
       const totalCount = db.count();
-      await logger.info(`Library updated: ${totalCount} total items`);
+      const failedCount = db.failedCount();
+      await logger.info(`Library updated: ${totalCount} total items, ${failedCount} still failing`);
+      if (!result.reachedEnd) {
+        await logger.warn('Did not reach the end of the library; the next run will resume where this one stopped');
+      }
 
       // Complete job
       const stats = dm.getProgress();
@@ -114,6 +130,9 @@ export default async function archiveRoutes(fastify, opts) {
         failed: stats.failed,
         skipped: stats.skipped,
         total: totalCount,
+        listed: result.listed,
+        stillFailing: failedCount,
+        complete: result.reachedEnd,
         errors: dm.getErrors()
       };
     } catch (err) {

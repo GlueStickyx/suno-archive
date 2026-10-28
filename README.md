@@ -184,6 +184,8 @@ Downloads the user's entire archive as a ZIP file.
 **Smart Pagination Optimization:**
 - The system tracks which songs are already archived in a SQLite database
 - When fetching new content, it stops pagination after encountering 2 consecutive pages of already-downloaded content
+- This shortcut is only used when the previous run reached the end of the library. If a run was interrupted (closed, crashed, token expired), the next run automatically does a full sync and resumes near the page where it stopped
+- Songs that fail to download are remembered and retried at the start of every run
 - For large archives (1000+ songs), this reduces sync time from ~100 seconds to ~4 seconds when you only have a few new songs
 - First-time archives automatically use full sync mode to build the complete library
 
@@ -202,7 +204,7 @@ Downloads the user's entire archive as a ZIP file.
 - Prevents missing songs that might be beyond the early-stop threshold
 
 **Verify Files Mode:**
-- Checks the filesystem for existing files before downloading
+- Checks the filesystem for existing files before downloading, including songs already recorded in the database
 - Skips downloads only if the actual file exists on disk
 - Use this when you've moved/deleted files but the database still has records
 - Slower than database-only checking, but ensures files are actually present
@@ -213,7 +215,7 @@ Downloads the user's entire archive as a ZIP file.
 2. Create 5 new songs on Suno
 3. Second run: Smart pagination fetches only first 2 pages (~4 seconds), downloads 5 new songs
 4. Job interrupted after downloading 3/5 songs → **Database has all 1003 songs (1000 old + 3 new)**
-5. Third run (full sync enabled): Fetches all pages to be safe, downloads remaining 2 new songs
+5. Third run: The interrupted run is detected automatically, so it resumes from where it stopped and downloads the remaining 2 new songs
 
 ## Architecture
 

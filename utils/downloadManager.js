@@ -18,6 +18,8 @@ export class DownloadManager {
     this.fullSync = fullSync; // If true, disable smart pagination and fetch all pages
     this.verifyFiles = verifyFiles; // If true, check filesystem for existing files
     this.dlDir = dlDir; // Download directory for filesystem checks
+    this.filesOnDisk = null; // Map of clip id -> formats on disk, built when verifyFiles is on
+    this.attempted = 0; // Clips queued for download this run, for the limit
 
     this.progress = {
       total: 0,
@@ -30,26 +32,38 @@ export class DownloadManager {
     this.errors = [];
   }
 
-  async fetchLibrary() {
-    this.logger.info(`[${this.username}] Fetching library from Suno...`);
+  /**
+   * Walk the library page by page, downloading each page's new clips before
+   * fetching the next one, so progress is saved even if the token expires
+   * partway through a large library.
+   *
+   * onPage(nextPage) is called after each page is fully processed, so the
+   * caller can persist where to resume from.
+   *
+   * Returns { reachedEnd, listed, lastPage }. reachedEnd is true only when
+   * Suno ran out of pages or smart pagination legitimately stopped early.
+   */
+  async syncLibrary({ startPage = 0, onPage = null } = {}) {
+    this.logger.info(`[${this.username}] Fetching library from Suno starting at page ${startPage}...`);
 
-    let allItems = [];
-    let page = 0;
-    let hasMore = true;
+    let page = startPage;
+    let listed = 0;
     let consecutiveExistingPages = 0;
     const EARLY_STOP_THRESHOLD = 2; // Stop after 2 consecutive pages of all-existing content
 
-    // Calculate max pages needed if limit is set (20 items per page)
-    const maxPages = this.limit ? Math.ceil(this.limit / 20) : Infinity;
+    while (true) {
+      // Stop once the download limit (testing) has been reached
+      if (this.limit && this.attempted >= this.limit) {
+        this.logger.info(`[${this.username}] Download limit of ${this.limit} reached`);
+        return { reachedEnd: false, listed, lastPage: page };
+      }
 
-    // Paginate through all pages to get complete library
-    while (hasMore && page < maxPages) {
       // Rate limit between page requests (after first page)
-      if (page > 0) {
+      if (page > startPage) {
         await this.sleep(2000); // 2 seconds between page requests to avoid rate limits
       }
 
-      const url = `https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=true&hide_gen_stems=true&hide_studio_clips=true&page=${page}`;
+      const url = `https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=false&hide_gen_stems=true&hide_studio_clips=true&page=${page}`;
 
       const res = await this.retryFetch(url, {
         headers: {
@@ -60,61 +74,95 @@ export class DownloadManager {
 
       if (!res.ok) {
         const text = await res.text();
+        if (res.status === 401 || res.status === 403) {
+          throw new Error(`Suno rejected the token on page ${page} (HTTP ${res.status}). Tokens expire - paste a fresh one and run again. Progress is saved and the next run resumes near page ${page}.`);
+        }
         throw new Error(`Failed to fetch library (page ${page}): ${res.status} ${res.statusText}\n${text}`);
       }
 
       const data = await res.json();
       const clips = data.clips || data.songs || data.data || data.items || [];
 
-      if (clips.length === 0) {
-        hasMore = false;
-      } else {
-        allItems.push(...clips);
-        this.logger.info(`[${this.username}] Fetched page ${page}: ${clips.length} items (total: ${allItems.length})`);
-
-        // Log first clip structure on first page for debugging
-        if (page === 0 && clips.length > 0) {
+      if (page === startPage) {
+        const reportedTotal = data.num_total_results ?? data.total ?? data.total_count;
+        if (reportedTotal !== undefined) {
+          this.logger.info(`[${this.username}] Suno reports ${reportedTotal} clips in this library`);
+        }
+        if (clips.length > 0) {
           this.logger.info(`[${this.username}] Sample clip fields: ${Object.keys(clips[0]).join(', ')}`);
         }
+      }
 
-        // Smart pagination: check if all clips on this page already exist (unless fullSync is enabled)
-        if (!this.fullSync && this.existingIds.size > 0) {
-          const newClipsOnPage = clips.filter(c => !this.existingIds.has(c.id)).length;
+      if (clips.length === 0) {
+        this.logger.info(`[${this.username}] Reached end of library at page ${page} (${listed} clips listed this run)`);
+        return { reachedEnd: true, listed, lastPage: page };
+      }
 
-          if (newClipsOnPage === 0) {
-            consecutiveExistingPages++;
-            this.logger.info(`[${this.username}] Page ${page} contains all existing content (${consecutiveExistingPages}/${EARLY_STOP_THRESHOLD} consecutive)`);
+      listed += clips.length;
 
-            if (consecutiveExistingPages >= EARLY_STOP_THRESHOLD) {
-              this.logger.info(`[${this.username}] Early stop: ${EARLY_STOP_THRESHOLD} consecutive pages of existing content`);
-              hasMore = false;
-            }
-          } else {
-            consecutiveExistingPages = 0; // Reset counter if we find new content
-            this.logger.info(`[${this.username}] Page ${page} contains ${newClipsOnPage} new items`);
+      // With verifyFiles, already-archived clips are checked on disk too
+      const newClips = clips.filter(c => !this.existingIds.has(c.id));
+      let toProcess = this.verifyFiles ? clips : newClips;
+      if (this.limit) {
+        toProcess = toProcess.slice(0, Math.max(0, this.limit - this.attempted));
+      }
+
+      this.logger.info(`[${this.username}] Page ${page}: ${clips.length} items, ${newClips.length} new (listed so far: ${listed})`);
+
+      if (toProcess.length > 0) {
+        this.progress.total += toProcess.length;
+        this.attempted += toProcess.length;
+        await this.downloadBatch(toProcess, this.dlDir);
+      }
+
+      page++;
+      if (onPage) onPage(page);
+
+      // Smart pagination: stop after consecutive pages of already-archived content.
+      // Only safe when the previous run reached the end of the library.
+      if (!this.fullSync) {
+        if (newClips.length === 0) {
+          consecutiveExistingPages++;
+          if (consecutiveExistingPages >= EARLY_STOP_THRESHOLD) {
+            this.logger.info(`[${this.username}] Early stop: ${EARLY_STOP_THRESHOLD} consecutive pages of existing content`);
+            return { reachedEnd: true, listed, lastPage: page };
           }
-        } else if (this.fullSync) {
-          const newClipsOnPage = clips.filter(c => !this.existingIds.has(c.id)).length;
-          this.logger.info(`[${this.username}] Full sync mode: Page ${page} has ${newClipsOnPage} new items (smart pagination disabled)`);
-        }
-
-        page++;
-
-        // Stop early if we've exceeded the limit
-        if (this.limit && allItems.length >= this.limit) {
-          hasMore = false;
+        } else {
+          consecutiveExistingPages = 0;
         }
       }
     }
+  }
 
-    this.logger.info(`[${this.username}] Found ${allItems.length} total items`);
-    return { items: allItems };
+  // Retry clips that failed in earlier runs
+  async retryFailed(clips) {
+    const pending = clips.filter(c => !this.existingIds.has(c.id));
+    if (pending.length === 0) return;
+
+    this.logger.info(`[${this.username}] Retrying ${pending.length} clips that failed in earlier runs`);
+    this.progress.total += pending.length;
+    await this.downloadBatch(pending, this.dlDir);
+  }
+
+  // Index files already on disk by clip id, so verifyFiles still matches
+  // when a song's title has changed since it was downloaded
+  async indexFilesOnDisk() {
+    this.filesOnDisk = new Map();
+    const names = await fs.readdir(this.dlDir);
+    for (const name of names) {
+      const match = name.match(/ - ([^ ]+)\.(mp3|wav)$/);
+      if (!match) continue;
+      const [, id, fmt] = match;
+      if (!this.filesOnDisk.has(id)) this.filesOnDisk.set(id, new Set());
+      this.filesOnDisk.get(id).add(fmt);
+    }
+    this.logger.info(`[${this.username}] Found files for ${this.filesOnDisk.size} clips on disk`);
   }
 
   async retryFetch(url, options, attempt = 1) {
+    let response;
     try {
-      const response = await fetch(url, options);
-      return response;
+      response = await fetch(url, options);
     } catch (err) {
       if (attempt < this.maxRetries) {
         const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
@@ -124,12 +172,26 @@ export class DownloadManager {
       }
       throw err;
     }
+
+    // Rate limited or server error: back off and retry instead of giving up
+    if ((response.status === 429 || response.status >= 500) && attempt < this.maxRetries) {
+      const retryAfter = parseInt(response.headers.get('retry-after'));
+      const delay = retryAfter > 0
+        ? Math.min(retryAfter * 1000, 120000)
+        : Math.min(5000 * Math.pow(2, attempt), 60000);
+      this.logger.warn(`[${this.username}] HTTP ${response.status}, retry ${attempt}/${this.maxRetries} after ${delay}ms`);
+      await this.sleep(delay);
+      return this.retryFetch(url, options, attempt + 1);
+    }
+
+    return response;
   }
 
   async downloadItem(item, dlDir) {
     if (!item.audio_url) {
       this.logger.warn(`[${this.username}] No audio URL for item ${item.id}, skipping`);
       this.progress.skipped++;
+      this.errors.push({ id: item.id, error: 'No audio URL' });
       return false;
     }
 
@@ -146,21 +208,11 @@ export class DownloadManager {
     const formats = this.format === 'both' ? ['mp3', 'wav'] : [this.format];
 
     // If verifyFiles is enabled, check if all required files exist
-    if (this.verifyFiles) {
-      let allFilesExist = true;
-      for (const fmt of formats) {
-        const fileName = `${fileBase}.${fmt}`;
-        const filePath = path.join(dlDir, fileName);
-        try {
-          await fs.access(filePath);
-        } catch {
-          allFilesExist = false;
-          break;
-        }
-      }
+    if (this.verifyFiles && this.filesOnDisk) {
+      const onDisk = this.filesOnDisk.get(item.id);
+      const allFilesExist = formats.every(fmt => onDisk && onDisk.has(fmt));
 
       if (allFilesExist) {
-        this.logger.info(`[${this.username}] ⏭ ${fileBase} (files exist, skipping)`);
         this.progress.skipped++;
         return true; // File exists, consider it a success
       }
@@ -190,7 +242,7 @@ export class DownloadManager {
 
         if (!audio.ok) {
           // Handle format-specific errors (e.g., WAV restricted by plan)
-          if (audio.status >= 400 && audio.status < 500) {
+          if (audio.status >= 400 && audio.status < 500 && audio.status !== 429) {
             formatErrors.push(`${fmt.toUpperCase()} not available (HTTP ${audio.status})`);
             this.logger.warn(`[${this.username}] ${fmt.toUpperCase()} format not available for ${item.id} (plan restriction?)`);
             continue; // Try next format without failing
@@ -243,11 +295,18 @@ export class DownloadManager {
       if (item) {
         const success = await this.downloadItem(item, dlDir);
 
-        // Write to database immediately after successful download
-        if (success && this.db) {
+        // Write to database immediately after each download attempt
+        if (this.db) {
           try {
-            this.db.insert(item);
-            this.existingIds.add(item.id); // Update in-memory set for smart pagination
+            if (success) {
+              this.db.insert(item);
+              this.db.removeFailed(item.id);
+              this.existingIds.add(item.id); // Update in-memory set for smart pagination
+            } else {
+              // Remember failures so later runs retry them even if smart pagination stops early
+              const error = this.errors.find(e => e.id === item.id)?.error || 'unknown error';
+              this.db.addFailed(item, error);
+            }
           } catch (err) {
             this.logger.error(`[${this.username}] Failed to write ${item.id} to database: ${err.message}`);
           }

@@ -27,6 +27,18 @@ export class LibraryDB {
       );
 
       CREATE INDEX IF NOT EXISTS idx_created_at ON clips(created_at);
+
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS failed_clips (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        error TEXT,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
     `);
   }
 
@@ -77,6 +89,40 @@ export class LibraryDB {
   count() {
     const stmt = this.db.prepare('SELECT COUNT(*) as count FROM clips');
     return stmt.get().count;
+  }
+
+  // Sync state (e.g. whether the last run reached the end of the library)
+  getMeta(key) {
+    const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key);
+    return row ? row.value : null;
+  }
+
+  setMeta(key, value) {
+    if (value === null || value === undefined) {
+      this.db.prepare('DELETE FROM meta WHERE key = ?').run(key);
+    } else {
+      this.db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(key, String(value));
+    }
+  }
+
+  // Clips that failed to download, retried at the start of every run
+  addFailed(clip, error) {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO failed_clips (id, data, error, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    `).run(clip.id, JSON.stringify(clip), error);
+  }
+
+  removeFailed(clipId) {
+    this.db.prepare('DELETE FROM failed_clips WHERE id = ?').run(clipId);
+  }
+
+  getFailed() {
+    return this.db.prepare('SELECT data FROM failed_clips').all().map(row => JSON.parse(row.data));
+  }
+
+  failedCount() {
+    return this.db.prepare('SELECT COUNT(*) as count FROM failed_clips').get().count;
   }
 
   // Close database connection
