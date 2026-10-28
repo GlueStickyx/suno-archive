@@ -1,7 +1,9 @@
 import fs from 'fs/promises';
 import path from 'path';
+import { PassThrough } from 'stream';
 import { ensureUserDirs, sanitizeName, cleanToken, tokenExpiry } from '../utils/fileHelpers.js';
-import { DownloadManager } from '../utils/downloadManager.js';
+import { DownloadManager, EXTRA_FOLDERS } from '../utils/downloadManager.js';
+import { writeLibraryCsv } from '../utils/exportCsv.js';
 import { Logger } from '../utils/logger.js';
 import { jobManager } from '../utils/jobManager.js';
 import { LibraryDB } from '../utils/database.js';
@@ -15,7 +17,7 @@ export default async function archiveRoutes(fastify, opts) {
   const activeRuns = new Map();
 
   fastify.post('/run', async (req, reply) => {
-    const { username, cookie, limit, rateLimitMs, format, fullSync, verifyFiles } = req.body;
+    const { username, cookie, limit, rateLimitMs, format, fullSync, verifyFiles, extras = {} } = req.body;
     if (!cookie || !username)
       return reply.code(400).send({ error: 'Missing username or token' });
 
@@ -59,7 +61,13 @@ export default async function archiveRoutes(fastify, opts) {
       // full sync once to pick up anything an interrupted run left behind.
       const lastSyncComplete = db.getMeta('sync_complete') === '1';
       const resumePage = parseInt(db.getMeta('resume_page')) || 0;
-      const shouldFullSync = fullSync || verifyFiles || oldIds.size === 0 || !lastSyncComplete;
+      // Extras the user asked for: art, video, lyrics, metadata, sources
+      const wantedExtras = EXTRA_FOLDERS.filter(folder => extras[folder]);
+      // Every archived song has to be revisited once to fill in a newly chosen extra
+      const extrasDone = (db.getMeta('extras_complete') || '').split(',').filter(Boolean);
+      const extrasBackfill = wantedExtras.some(folder => !extrasDone.includes(folder));
+
+      const shouldFullSync = fullSync || verifyFiles || oldIds.size === 0 || !lastSyncComplete || extrasBackfill;
 
       // Resume an unfinished sync a couple of pages early, in case songs
       // were deleted and shifted the pages since then
@@ -75,6 +83,10 @@ export default async function archiveRoutes(fastify, opts) {
 
       if (verifyFiles) {
         await logger.info('Verify files mode enabled: checking filesystem for existing files');
+      }
+
+      if (wantedExtras.length > 0) {
+        await logger.info(`Saving extras: ${wantedExtras.join(', ')}${extrasBackfill ? ' (checking every archived song for missing extras)' : ''}`);
       }
 
       // Initialize download manager
@@ -94,6 +106,8 @@ export default async function archiveRoutes(fastify, opts) {
         verifyFiles: verifyFiles || false, // Enable filesystem verification if requested
         dlDir: dlDir, // Pass download directory for file checks
         onProgress: progress => jobManager.updateProgress(user, progress),
+        extras: Object.fromEntries(wantedExtras.map(folder => [folder, true])),
+        userDir: baseDir,
         tokenWaitMs: process.env.TOKEN_WAIT_MS ? parseInt(process.env.TOKEN_WAIT_MS) : undefined
       });
       activeRuns.set(user, dm);
@@ -102,9 +116,19 @@ export default async function archiveRoutes(fastify, opts) {
         await dm.indexFilesOnDisk();
       }
 
+      if (wantedExtras.length > 0) {
+        await dm.indexExtrasOnDisk();
+      }
+
       // Mark the sync as in progress until it reaches the end of the library
       db.setMeta('sync_complete', '0');
       db.setMeta('resume_page', startPage);
+
+      // Extras filled in for every song visited by this walk through the library,
+      // carried over when an interrupted walk is resumed
+      const carriedExtras = (db.getMeta('walk_extras') || '').split(',');
+      const walkExtras = startPage === 0 ? wantedExtras : wantedExtras.filter(folder => carriedExtras.includes(folder));
+      db.setMeta('walk_extras', walkExtras.join(','));
 
       // Retry anything that failed in earlier runs
       await dm.retryFailed(db.getFailed());
@@ -119,6 +143,18 @@ export default async function archiveRoutes(fastify, opts) {
       if (result.reachedEnd) {
         db.setMeta('sync_complete', '1');
         db.setMeta('resume_page', null);
+        // Only a walk through the whole library has filled in extras for every song
+        if (shouldFullSync) {
+          db.setMeta('extras_complete', [...new Set([...extrasDone, ...walkExtras])].join(','));
+        }
+        db.setMeta('walk_extras', null);
+      }
+
+      // Spreadsheet of the whole library, for Excel or another app
+      try {
+        await writeLibraryCsv(db, baseDir);
+      } catch (err) {
+        await logger.warn(`Could not write library.csv: ${err.message}`);
       }
 
       const totalCount = db.count();
@@ -141,6 +177,8 @@ export default async function archiveRoutes(fastify, opts) {
         downloaded: stats.downloaded,
         failed: stats.failed,
         skipped: stats.skipped,
+        extrasSaved: stats.extrasSaved,
+        extrasFailed: stats.extrasFailed,
         total: totalCount,
         listed: result.listed,
         stillFailing: failedCount,
@@ -218,9 +256,12 @@ export default async function archiveRoutes(fastify, opts) {
   });
 
   // Export user archive as ZIP
-  fastify.post('/export/:username', async (req, reply) => {
+  fastify.get('/export/:username', async (req, reply) => {
     const user = sanitizeName(req.params.username);
     const userDir = path.join(dataDir, user);
+
+    if (activeRuns.has(user))
+      return reply.code(409).send({ error: 'Wait for the archive run to finish before exporting' });
 
     try {
       await fs.access(userDir);
@@ -228,18 +269,24 @@ export default async function archiveRoutes(fastify, opts) {
       return reply.code(404).send({ error: 'User archive not found' });
     }
 
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    // Audio and video are already compressed, so store files as-is for speed
+    const archive = archiver('zip', { store: true });
 
     archive.on('error', (err) => {
       fastify.log.error(`Archive error for ${user}: ${err.message}`);
       reply.code(500).send({ error: 'Failed to create archive' });
     });
 
+    // Skip half-written files from an interrupted run
+    archive.glob('**/*', { cwd: userDir, ignore: ['**/*.part'] });
+    archive.finalize();
+
+    // Hand Fastify a core Node stream; it sends archiver's own stream as an empty body
+    const body = new PassThrough();
+    archive.pipe(body);
+
     reply.header('Content-Type', 'application/zip');
     reply.header('Content-Disposition', `attachment; filename="${user}-archive.zip"`);
-    reply.send(archive);
-
-    archive.directory(userDir, false);
-    archive.finalize();
+    return reply.send(body);
   });
 }

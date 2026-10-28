@@ -177,6 +177,25 @@ Downloads the user's entire archive as a ZIP file.
 
 **Security Note:** Your bearer token is never stored persistently. It only exists in memory during the archive job and is immediately discarded afterward.
 
+## What Gets Saved & Folder Layout
+
+Besides the audio, the "Also Save" checkboxes save extras for every song, including songs archived by earlier runs:
+
+```
+data/<username>/
+├── downloads/   Title - id.mp3 / .wav   audio
+├── art/         Title - id.jpeg         cover art
+├── video/       Title - id.mp4          video (off by default, large)
+├── lyrics/      Title - id.txt          title, date, style and lyrics
+├── metadata/    Title - id.json         everything Suno returned for the song
+├── sources/     <id>.json               songs it was remixed, covered or extended from
+├── library.csv  spreadsheet of the whole library, newest first (opens in Excel)
+├── library.db   SQLite database of every archived song
+└── logs/        one log per run
+```
+
+Every file name ends in the song's Suno id, so a song's audio, art, lyrics and details can always be matched up, even if it was renamed. "Download everything as ZIP" packs this whole folder.
+
 ## Smart Pagination & Interruption Handling
 
 ### How Incremental Sync Works

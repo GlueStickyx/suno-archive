@@ -299,3 +299,22 @@ pre {
 .sync-state.warn {
   background: #fffaf0;
 }
+
+.extras-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 6px 16px;
+  margin: 6px 0;
+}
+
+.extras-grid label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: normal;
+  margin: 0;
+}
+
+.extras-grid input {
+  width: auto;
+}

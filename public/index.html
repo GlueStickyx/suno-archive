@@ -37,6 +37,18 @@
         </div>
 
         <div class="form-group">
+          <label>Also Save</label>
+          <div class="extras-grid">
+            <label><input type="checkbox" name="extra" value="art" checked /> <span>Cover art</span></label>
+            <label><input type="checkbox" name="extra" value="lyrics" checked /> <span>Lyrics + style (.txt)</span></label>
+            <label><input type="checkbox" name="extra" value="metadata" checked /> <span>All song details (.json)</span></label>
+            <label><input type="checkbox" name="extra" value="sources" checked /> <span>Songs it was remixed / extended from</span></label>
+            <label><input type="checkbox" name="extra" value="video" /> <span>Video (.mp4, large)</span></label>
+          </div>
+          <small class="help-text">Each goes in its own folder next to your audio, named "Title - id" like the audio files. Songs you already archived get their extras filled in too. A spreadsheet of your whole library (library.csv) is always saved.</small>
+        </div>
+
+        <div class="form-group">
           <label for="limit">Download Limit (optional)</label>
           <input id="limit" name="limit" type="number" min="1" placeholder="Leave empty for all, or enter a number (e.g., 5)" />
           <small class="help-text">For testing: limit how many new songs to download</small>
@@ -81,6 +93,8 @@
           <div class="stat"><div class="stat-value" id="live-failed">0</div><div class="stat-label">Failed</div></div>
           <div class="stat"><div class="stat-value" id="live-skipped">0</div><div class="stat-label">Skipped</div></div>
           <div class="stat"><div class="stat-value" id="live-rate">-</div><div class="stat-label">Songs / min</div></div>
+          <div class="stat"><div class="stat-value" id="live-extras">0</div><div class="stat-label">Extras saved</div></div>
+          <div class="stat"><div class="stat-value" id="live-extras-failed">0</div><div class="stat-label">Extras failed</div></div>
         </div>
         <div class="live-line"><span>Now:</span> <span id="live-track">-</span></div>
         <div class="live-line"><span>Running for:</span> <span id="live-elapsed">-</span></div>
@@ -164,6 +178,7 @@
       const limit = form.limit.value ? parseInt(form.limit.value) : null;
       const fullSync = document.getElementById('fullSync').checked;
       const verifyFiles = document.getElementById('verifyFiles').checked;
+      const extras = Object.fromEntries([...document.querySelectorAll('input[name="extra"]')].map(box => [box.value, box.checked]));
       currentUsername = username;
 
       // Reset UI
@@ -184,7 +199,7 @@
       startPolling(username);
 
       try {
-        const payload = { username, cookie, format, fullSync, verifyFiles };
+        const payload = { username, cookie, format, fullSync, verifyFiles, extras };
         if (limit) payload.limit = limit;
 
         const res = await fetch('/api/run', {
@@ -237,7 +252,11 @@
           : ' The last run did not reach the end of your library. The next run scans everything.';
       }
       if (status.failedCount) text += ` ${fmtNum(status.failedCount)} songs failed before and will be retried.`;
-      box.textContent = text;
+      box.textContent = text + ' ';
+      const exportLink = document.createElement('a');
+      exportLink.href = `/api/export/${encodeURIComponent(usernameInput.value.trim())}`;
+      exportLink.textContent = 'Download everything as ZIP';
+      box.appendChild(exportLink);
       box.classList.toggle('warn', !status.syncComplete);
       box.classList.remove('hidden');
     }
@@ -294,6 +313,8 @@
       document.getElementById('live-downloaded').textContent = fmtNum(p.downloaded);
       document.getElementById('live-failed').textContent = fmtNum(p.failed);
       document.getElementById('live-skipped').textContent = fmtNum(p.skipped);
+      document.getElementById('live-extras').textContent = fmtNum(p.extrasSaved);
+      document.getElementById('live-extras-failed').textContent = fmtNum(p.extrasFailed);
       document.getElementById('live-track').textContent = p.currentTrack || '-';
 
       const elapsed = (job.endTime || Date.now()) - job.startTime;
@@ -362,6 +383,14 @@
           <div class="stat">
             <div class="stat-value">${data.skipped || 0}</div>
             <div class="stat-label">Skipped</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value">${data.extrasSaved || 0}</div>
+            <div class="stat-label">Extras saved</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value">${data.extrasFailed || 0}</div>
+            <div class="stat-label">Extras failed</div>
           </div>
         </div>
       `;

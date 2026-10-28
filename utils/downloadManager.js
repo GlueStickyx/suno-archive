@@ -3,7 +3,7 @@ import path from 'path';
 import fetch from 'node-fetch';
 
 export class DownloadManager {
-  constructor({ dataDir, username, cookie, logger, concurrency = 3, maxRetries = 3, rateLimitMs = 1000, limit = null, format = 'mp3', existingIds = new Set(), db = null, fullSync = false, verifyFiles = false, dlDir = null, onProgress = null, tokenWaitMs = 30 * 60 * 1000 }) {
+  constructor({ dataDir, username, cookie, logger, concurrency = 3, maxRetries = 3, rateLimitMs = 1000, limit = null, format = 'mp3', existingIds = new Set(), db = null, fullSync = false, verifyFiles = false, dlDir = null, onProgress = null, tokenWaitMs = 30 * 60 * 1000, extras = {}, userDir = null }) {
     this.dataDir = dataDir;
     this.username = username;
     this.cookie = cookie;
@@ -23,6 +23,9 @@ export class DownloadManager {
     this.onProgress = onProgress; // Called with getProgress() whenever something changes
     this.tokenWaitMs = tokenWaitMs; // How long to wait for a fresh token before giving up
     this.newToken = null; // Set by supplyToken() while waiting
+    this.extras = extras; // Which extras to save: { art, video, lyrics, metadata, sources }
+    this.userDir = userDir; // Parent folder of downloads/, where the extras folders live
+    this.extrasOnDisk = null; // Map of folder -> Set of clip ids, built by indexExtrasOnDisk()
 
     this.progress = {
       total: 0,
@@ -34,7 +37,9 @@ export class DownloadManager {
       page: 0,
       startPage: 0,
       listed: 0,
-      currentTrack: null
+      currentTrack: null,
+      extrasSaved: 0,
+      extrasFailed: 0
     };
 
     this.errors = [];
@@ -118,9 +123,12 @@ export class DownloadManager {
       this.progress.listed = listed;
       this.report();
 
-      // With verifyFiles, already-archived clips are checked on disk too
+      // With verifyFiles, already-archived clips are checked on disk too.
+      // Already-archived clips are also revisited when they are missing extras.
       const newClips = clips.filter(c => !this.existingIds.has(c.id));
-      let toProcess = this.verifyFiles ? clips : newClips;
+      let toProcess = this.verifyFiles
+        ? clips
+        : clips.filter(c => !this.existingIds.has(c.id) || this.needsExtras(c));
       if (this.limit) {
         toProcess = toProcess.slice(0, Math.max(0, this.limit - this.attempted));
       }
@@ -212,6 +220,106 @@ export class DownloadManager {
     if (this.onProgress) this.onProgress(this.getProgress());
   }
 
+  hasExtras() {
+    return Object.values(this.extras).some(Boolean);
+  }
+
+  // Index the extras folders by clip id, so clips that already have them are skipped
+  async indexExtrasOnDisk() {
+    this.extrasOnDisk = new Map();
+    for (const folder of EXTRA_FOLDERS) {
+      const ids = new Set();
+      const dir = path.join(this.userDir, folder);
+      await fs.mkdir(dir, { recursive: true });
+      for (const name of await fs.readdir(dir)) {
+        const match = folder === 'sources' ? name.match(/^(.+)\.json$/) : name.match(/ - ([^ ]+)\.\w+$/);
+        if (match) ids.add(match[1]);
+      }
+      this.extrasOnDisk.set(folder, ids);
+    }
+  }
+
+  extraDone(folder, id) {
+    return this.extrasOnDisk?.get(folder)?.has(id) ?? false;
+  }
+
+  // Which extras this clip still needs, as a list of folder names
+  missingExtras(item) {
+    const missing = [];
+    if (this.extras.art && artUrl(item) && !this.extraDone('art', item.id)) missing.push('art');
+    if (this.extras.video && item.video_url && !this.extraDone('video', item.id)) missing.push('video');
+    if (this.extras.lyrics && !this.extraDone('lyrics', item.id)) missing.push('lyrics');
+    if (this.extras.metadata && !this.extraDone('metadata', item.id)) missing.push('metadata');
+    if (this.extras.sources && this.missingSources(item).length > 0) missing.push('sources');
+    return missing;
+  }
+
+  needsExtras(item) {
+    return this.hasExtras() && this.missingExtras(item).length > 0;
+  }
+
+  // Songs this clip was remixed, covered or extended from that aren't in the library
+  missingSources(item) {
+    return sourceIds(item).filter(id => !this.existingIds.has(id) && !this.extraDone('sources', id));
+  }
+
+  async saveExtras(item) {
+    const fileBase = safeFileBase(item);
+
+    for (const folder of this.missingExtras(item)) {
+      try {
+        if (folder === 'art') {
+          const url = artUrl(item);
+          await this.downloadTo(url, path.join(this.userDir, 'art', `${fileBase}.${urlExtension(url, 'jpg')}`));
+        } else if (folder === 'video') {
+          await this.downloadTo(item.video_url, path.join(this.userDir, 'video', `${fileBase}.${urlExtension(item.video_url, 'mp4')}`));
+        } else if (folder === 'lyrics') {
+          await writeFileSafely(path.join(this.userDir, 'lyrics', `${fileBase}.txt`), lyricsText(item));
+        } else if (folder === 'metadata') {
+          await writeFileSafely(path.join(this.userDir, 'metadata', `${fileBase}.json`), JSON.stringify(item, null, 2));
+        } else if (folder === 'sources') {
+          await this.saveSources(item);
+        }
+
+        if (folder !== 'sources') this.extrasOnDisk.get(folder).add(item.id);
+        this.progress.extrasSaved++;
+      } catch (err) {
+        this.progress.extrasFailed++;
+        this.logger.warn(`[${this.username}] Could not save ${folder} for ${fileBase}: ${err.message}`);
+      }
+    }
+  }
+
+  // Save details of the songs a clip was made from, which may belong to other users
+  // and can't be looked up once the account is gone
+  async saveSources(item) {
+    for (const id of this.missingSources(item)) {
+      if (this.rateLimitMs > 0) await this.sleep(this.rateLimitMs);
+
+      const res = await this.retryFetch(`https://studio-api.prod.suno.com/api/clip/${id}`, {
+        headers: { 'Authorization': `Bearer ${this.cookie}` }
+      });
+
+      let data;
+      if (res.ok) {
+        data = await res.json();
+      } else if (res.status === 404) {
+        data = { id, unavailable: true, note: 'Suno returned 404 for this source song' };
+      } else {
+        throw new Error(`source ${id}: HTTP ${res.status}`);
+      }
+
+      await writeFileSafely(path.join(this.userDir, 'sources', `${id}.json`), JSON.stringify(data, null, 2));
+      this.extrasOnDisk.get('sources').add(id);
+    }
+  }
+
+  async downloadTo(url, outPath) {
+    const res = await this.retryFetch(url, {});
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    await writeFileSafely(outPath, Buffer.from(await res.arrayBuffer()));
+  }
+
   async retryFetch(url, options, attempt = 1) {
     let response;
     try {
@@ -249,13 +357,7 @@ export class DownloadManager {
     }
 
     // Create safe filename base: "title - id"
-    const safeTitle = (item.title || 'untitled')
-      .replace(/[/\\?%*:|"<>]/g, '-') // Replace invalid chars
-      .replace(/\s+/g, ' ')            // Normalize whitespace
-      .trim()
-      .slice(0, 100);                   // Limit length
-
-    const fileBase = `${safeTitle} - ${item.id}`;
+    const fileBase = safeFileBase(item);
     this.progress.currentTrack = item.title || item.id;
 
     // Determine which formats to download
@@ -305,7 +407,7 @@ export class DownloadManager {
         }
 
         const buf = Buffer.from(await audio.arrayBuffer());
-        await fs.writeFile(outPath, buf);
+        await writeFileSafely(outPath, buf);
 
         this.logger.info(`[${this.username}] ✓ ${fileName} (${this.progress.downloaded}/${this.progress.total})`);
         successCount++;
@@ -347,7 +449,18 @@ export class DownloadManager {
     while (queue.length > 0) {
       const item = queue.shift();
       if (item) {
-        const success = await this.downloadItem(item, dlDir);
+        // Clips already archived are only here to fill in missing extras
+        let success = true;
+        if (!this.existingIds.has(item.id) || this.verifyFiles) {
+          success = await this.downloadItem(item, dlDir);
+        } else {
+          this.progress.currentTrack = item.title || item.id;
+          this.progress.skipped++;
+        }
+
+        if (success && this.hasExtras()) {
+          await this.saveExtras(item);
+        }
         this.report();
 
         // Write to database immediately after each download attempt
@@ -381,4 +494,63 @@ export class DownloadManager {
   getErrors() {
     return [...this.errors];
   }
+}
+
+export const EXTRA_FOLDERS = ['art', 'video', 'lyrics', 'metadata', 'sources'];
+
+// "title - id", the shared name for a clip's files in every folder
+export function safeFileBase(item) {
+  const safeTitle = (item.title || 'untitled')
+    .replace(/[/\\?%*:|"<>]/g, '-') // Replace invalid chars
+    .replace(/\s+/g, ' ')            // Normalize whitespace
+    .trim()
+    .slice(0, 100);                   // Limit length
+  return `${safeTitle} - ${item.id}`;
+}
+
+function artUrl(item) {
+  return item.image_large_url || item.image_url || null;
+}
+
+function urlExtension(url, fallback) {
+  const match = new URL(url).pathname.match(/\.(\w{2,4})$/);
+  return match ? match[1].toLowerCase() : fallback;
+}
+
+// Ids of songs this clip was remixed, covered, extended or edited from
+export function sourceIds(item) {
+  const meta = item.metadata || {};
+  const ids = new Set();
+  for (const [key, value] of Object.entries(meta)) {
+    if (key.endsWith('_clip_id') && typeof value === 'string' && value) ids.add(value);
+  }
+  for (const list of [meta.history, meta.concat_history]) {
+    if (!Array.isArray(list)) continue;
+    for (const entry of list) {
+      if (entry && typeof entry.id === 'string') ids.add(entry.id);
+    }
+  }
+  ids.delete(item.id);
+  return [...ids];
+}
+
+function lyricsText(item) {
+  const meta = item.metadata || {};
+  const lines = [
+    `Title: ${item.title || 'untitled'}`,
+    `Date: ${item.created_at || ''}`,
+    `Style: ${meta.tags || ''}`
+  ];
+  if (meta.negative_tags) lines.push(`Excluded styles: ${meta.negative_tags}`);
+  if (meta.gpt_description_prompt) lines.push(`Description: ${meta.gpt_description_prompt}`);
+  lines.push('', meta.prompt ? meta.prompt : '(no lyrics)');
+  return lines.join('\n') + '\n';
+}
+
+// Write to a temporary file first, so an interrupted run never leaves a
+// half-written file that later looks complete
+async function writeFileSafely(outPath, data) {
+  const tmpPath = `${outPath}.part`;
+  await fs.writeFile(tmpPath, data);
+  await fs.rename(tmpPath, outPath);
 }
