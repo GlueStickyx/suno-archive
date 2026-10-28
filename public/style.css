@@ -251,3 +251,51 @@ pre {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+.live-grid {
+  margin-top: 16px;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.live-line {
+  margin-top: 8px;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.live-line > span:first-child {
+  color: #666;
+}
+
+.live-line .warn {
+  color: #b7791f;
+  font-weight: 600;
+}
+
+.live-line .bad {
+  color: #c53030;
+  font-weight: 600;
+}
+
+.token-refresh {
+  margin-top: 16px;
+  padding: 12px;
+  border: 2px solid #c53030;
+  border-radius: 8px;
+}
+
+.token-refresh textarea {
+  width: 100%;
+  margin: 8px 0;
+}
+
+.sync-state {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #ebf8ff;
+  font-size: 14px;
+}
+
+.sync-state.warn {
+  background: #fffaf0;
+}

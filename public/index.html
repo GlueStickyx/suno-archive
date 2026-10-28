@@ -23,7 +23,7 @@
         <div class="form-group">
           <label for="cookie">Suno Bearer Token</label>
           <textarea id="cookie" name="cookie" placeholder="Paste your Suno bearer token here..." required></textarea>
-          <small class="help-text">Your token is never stored and only used for this request</small>
+          <small class="help-text">Your token is never stored and only used for this run. Tokens expire: if yours does mid-run, the run pauses and you can paste a fresh one without starting over.</small>
         </div>
 
         <div class="form-group">
@@ -58,6 +58,8 @@
           <small class="help-text">Check filesystem for existing files before downloading (slower, but re-downloads missing files)</small>
         </div>
 
+        <div id="sync-state" class="sync-state hidden"></div>
+
         <button type="submit" id="submit-btn">
           <span class="btn-text">Start Archive</span>
         </button>
@@ -71,6 +73,24 @@
           <div id="progress-fill" class="progress-fill"></div>
         </div>
         <div id="status-text" class="status-text"></div>
+
+        <div id="live-stats" class="result-grid live-grid">
+          <div class="stat"><div class="stat-value" id="live-page">-</div><div class="stat-label">Page</div></div>
+          <div class="stat"><div class="stat-value" id="live-listed">0</div><div class="stat-label">Songs scanned</div></div>
+          <div class="stat"><div class="stat-value" id="live-downloaded">0</div><div class="stat-label">Downloaded</div></div>
+          <div class="stat"><div class="stat-value" id="live-failed">0</div><div class="stat-label">Failed</div></div>
+          <div class="stat"><div class="stat-value" id="live-skipped">0</div><div class="stat-label">Skipped</div></div>
+          <div class="stat"><div class="stat-value" id="live-rate">-</div><div class="stat-label">Songs / min</div></div>
+        </div>
+        <div class="live-line"><span>Now:</span> <span id="live-track">-</span></div>
+        <div class="live-line"><span>Running for:</span> <span id="live-elapsed">-</span></div>
+        <div class="live-line"><span>Token:</span> <span id="live-token">-</span></div>
+
+        <div id="token-refresh" class="token-refresh hidden">
+          <p>⏸ Suno rejected the token, so the run is paused. Grab a fresh token (same steps as before), paste it here and the run continues where it stopped.</p>
+          <textarea id="new-token" placeholder="Paste a fresh bearer token..."></textarea>
+          <button type="button" id="new-token-btn">Continue with new token</button>
+        </div>
       </div>
     </div>
 
@@ -117,6 +137,9 @@
         const res = await fetch(`/api/db-status/${username}`);
         const status = await res.json();
 
+        showSyncState(status);
+        reattachIfRunning(username);
+
         if (status.isEmpty) {
           fullSyncCheckbox.checked = true;
           fullSyncCheckbox.disabled = true;
@@ -158,6 +181,8 @@
       statusText.textContent = statusMsg + '...';
       progressFill.style.width = '0%';
 
+      startPolling(username);
+
       try {
         const payload = { username, cookie, format, fullSync, verifyFiles };
         if (limit) payload.limit = limit;
@@ -178,8 +203,137 @@
       } catch (err) {
         showError(err.message);
       } finally {
+        stopPolling();
         submitBtn.disabled = false;
         submitBtn.innerHTML = '<span class="btn-text">Start Archive</span>';
+      }
+    });
+
+
+    // ---- Live progress ----
+    let pollTimer = null;
+    let tokenExpiresAt = null;
+    const phaseText = {
+      starting: '🔄 Starting...',
+      retrying_failed: '🔁 Retrying songs that failed last time...',
+      listing: '🔄 Scanning your library and downloading...',
+      waiting_for_token: '⏸ Paused: waiting for a fresh token',
+      done: '🔄 Finishing up...'
+    };
+    const fmtNum = n => (n ?? 0).toLocaleString();
+    const fmtDuration = ms => {
+      const s = Math.max(0, Math.floor(ms / 1000));
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      return h ? `${h}h ${m}m` : `${m}m ${sec}s`;
+    };
+
+    function showSyncState(status) {
+      const box = document.getElementById('sync-state');
+      if (!status.exists || status.isEmpty) { box.classList.add('hidden'); return; }
+      let text = `📚 ${fmtNum(status.count)} songs archived so far.`;
+      if (!status.syncComplete) {
+        text += status.resumePage
+          ? ` The last run stopped at page ${fmtNum(status.resumePage)}. The next run resumes there.`
+          : ' The last run did not reach the end of your library. The next run scans everything.';
+      }
+      if (status.failedCount) text += ` ${fmtNum(status.failedCount)} songs failed before and will be retried.`;
+      box.textContent = text;
+      box.classList.toggle('warn', !status.syncComplete);
+      box.classList.remove('hidden');
+    }
+
+    async function reattachIfRunning(username) {
+      try {
+        const res = await fetch(`/api/status/${username}`);
+        if (!res.ok) return;
+        const job = await res.json();
+        if (job.status === 'running') {
+          currentUsername = username;
+          statusSection.classList.remove('hidden');
+          submitBtn.disabled = true;
+          submitBtn.innerHTML = '<span class="btn-text">Running...</span>';
+          startPolling(username, true);
+        }
+      } catch {}
+    }
+
+    function startPolling(username, reattached = false) {
+      stopPolling();
+      const tick = async () => {
+        try {
+          const res = await fetch(`/api/status/${username}`);
+          if (!res.ok) return;
+          const job = await res.json();
+          renderLive(job);
+          // A reattached page has no pending /api/run request, so finish here
+          if (reattached && job.status !== 'running') {
+            stopPolling();
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = '<span class="btn-text">Start Archive</span>';
+            if (job.status === 'completed') showResults({ ...job.progress, total: job.libraryTotal, complete: job.complete, stillFailing: job.stillFailing });
+            else showError(job.error || 'Archive failed');
+          }
+        } catch {}
+      };
+      tick();
+      pollTimer = setInterval(tick, 2000);
+    }
+
+    function stopPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    function renderLive(job) {
+      const p = job.progress || {};
+      tokenExpiresAt = job.tokenExpiresAt;
+      if (job.status === 'running') statusText.textContent = phaseText[p.phase] || phaseText.listing;
+
+      document.getElementById('live-page').textContent = p.phase === 'retrying_failed' ? '-' : fmtNum(p.page);
+      document.getElementById('live-listed').textContent = fmtNum(p.listed);
+      document.getElementById('live-downloaded').textContent = fmtNum(p.downloaded);
+      document.getElementById('live-failed').textContent = fmtNum(p.failed);
+      document.getElementById('live-skipped').textContent = fmtNum(p.skipped);
+      document.getElementById('live-track').textContent = p.currentTrack || '-';
+
+      const elapsed = (job.endTime || Date.now()) - job.startTime;
+      document.getElementById('live-elapsed').textContent = fmtDuration(elapsed);
+      const minutes = elapsed / 60000;
+      document.getElementById('live-rate').textContent = minutes > 0.5 ? Math.round(p.downloaded / minutes) : '-';
+
+      // Progress bar: share of this run's queued songs that have been handled
+      const handled = (p.downloaded || 0) + (p.failed || 0) + (p.skipped || 0);
+      progressFill.style.width = p.total ? `${Math.min(100, (handled / p.total) * 100)}%` : '0%';
+
+      document.getElementById('token-refresh').classList.toggle('hidden', p.phase !== 'waiting_for_token');
+      renderToken(p.phase === 'waiting_for_token');
+    }
+
+    function renderToken(rejected) {
+      const el = document.getElementById('live-token');
+      el.className = '';
+      if (rejected) { el.textContent = 'rejected - paste a fresh one below'; el.className = 'bad'; return; }
+      if (!tokenExpiresAt) { el.textContent = 'ok (expiry unknown)'; return; }
+      const left = tokenExpiresAt - Date.now();
+      // Expired tokens are only a problem when the next page is fetched; the run pauses then
+      if (left <= 0) { el.textContent = 'expired - the run will pause for a new one when it needs it'; el.className = 'bad'; }
+      else { el.textContent = `expires in ${fmtDuration(left)}`; if (left < 5 * 60000) el.className = 'warn'; }
+    }
+
+    document.getElementById('new-token-btn').addEventListener('click', async () => {
+      const cookie = document.getElementById('new-token').value.trim();
+      if (!cookie || !currentUsername) return;
+      const res = await fetch(`/api/token/${currentUsername}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cookie })
+      });
+      if (res.ok) {
+        document.getElementById('new-token').value = '';
+        statusText.textContent = '▶️ Fresh token received, continuing...';
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || 'Could not send the token');
       }
     });
 

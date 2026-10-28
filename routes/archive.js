@@ -1,6 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { ensureUserDirs, sanitizeName } from '../utils/fileHelpers.js';
+import { ensureUserDirs, sanitizeName, cleanToken, tokenExpiry } from '../utils/fileHelpers.js';
 import { DownloadManager } from '../utils/downloadManager.js';
 import { Logger } from '../utils/logger.js';
 import { jobManager } from '../utils/jobManager.js';
@@ -11,12 +11,19 @@ import archiver from 'archiver';
 export default async function archiveRoutes(fastify, opts) {
   const { dataDir } = opts;
 
+  // Download managers for runs in progress, so a fresh token can be handed over mid-run
+  const activeRuns = new Map();
+
   fastify.post('/run', async (req, reply) => {
     const { username, cookie, limit, rateLimitMs, format, fullSync, verifyFiles } = req.body;
     if (!cookie || !username)
       return reply.code(400).send({ error: 'Missing username or token' });
 
     const user = sanitizeName(username);
+    if (activeRuns.has(user))
+      return reply.code(409).send({ error: 'An archive run is already in progress for this user' });
+
+    const token = cleanToken(cookie);
     const { baseDir, dlDir } = await ensureUserDirs(dataDir, user);
 
     // Use rate limit from request, or fall back to env var, or default to 2000ms (2 seconds)
@@ -27,6 +34,7 @@ export default async function archiveRoutes(fastify, opts) {
 
     // Initialize job tracking
     jobManager.create(user);
+    jobManager.update(user, { tokenExpiresAt: tokenExpiry(token) });
 
     // Initialize logger
     const logger = new Logger({
@@ -73,7 +81,7 @@ export default async function archiveRoutes(fastify, opts) {
       const dm = new DownloadManager({
         dataDir,
         username: user,
-        cookie,
+        cookie: token,
         logger,
         concurrency: effectiveConcurrency,
         maxRetries: effectiveMaxRetries,
@@ -84,8 +92,11 @@ export default async function archiveRoutes(fastify, opts) {
         db: db, // Pass database for incremental writes
         fullSync: shouldFullSync,
         verifyFiles: verifyFiles || false, // Enable filesystem verification if requested
-        dlDir: dlDir // Pass download directory for file checks
+        dlDir: dlDir, // Pass download directory for file checks
+        onProgress: progress => jobManager.updateProgress(user, progress),
+        tokenWaitMs: process.env.TOKEN_WAIT_MS ? parseInt(process.env.TOKEN_WAIT_MS) : undefined
       });
+      activeRuns.set(user, dm);
 
       if (verifyFiles) {
         await dm.indexFilesOnDisk();
@@ -120,6 +131,7 @@ export default async function archiveRoutes(fastify, opts) {
       // Complete job
       const stats = dm.getProgress();
       await logger.complete(stats);
+      jobManager.update(user, { complete: result.reachedEnd, stillFailing: failedCount, libraryTotal: totalCount });
       jobManager.complete(user, stats);
 
       db.close();
@@ -139,7 +151,24 @@ export default async function archiveRoutes(fastify, opts) {
       await logger.error(`Archive failed: ${err.message}`);
       jobManager.fail(user, err.message);
       return reply.code(500).send({ error: err.message });
+    } finally {
+      activeRuns.delete(user);
     }
+  });
+
+  // Hand a fresh token to a run that is waiting for one
+  fastify.post('/token/:username', async (req, reply) => {
+    const user = sanitizeName(req.params.username);
+    const { cookie } = req.body || {};
+    if (!cookie) return reply.code(400).send({ error: 'Missing token' });
+
+    const dm = activeRuns.get(user);
+    if (!dm) return reply.code(404).send({ error: 'No archive run in progress for this user' });
+
+    const token = cleanToken(cookie);
+    dm.supplyToken(token);
+    jobManager.update(user, { tokenExpiresAt: tokenExpiry(token) });
+    return { ok: true };
   });
 
   // Return current user library metadata
@@ -173,8 +202,16 @@ export default async function archiveRoutes(fastify, opts) {
     try {
       const db = new LibraryDB(dataDir, user);
       const count = db.count();
+      const status = {
+        exists: true,
+        count,
+        isEmpty: count === 0,
+        syncComplete: db.getMeta('sync_complete') === '1',
+        resumePage: parseInt(db.getMeta('resume_page')) || null,
+        failedCount: db.failedCount()
+      };
       db.close();
-      return { exists: true, count, isEmpty: count === 0 };
+      return status;
     } catch {
       return { exists: false, count: 0, isEmpty: true };
     }

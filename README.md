@@ -196,6 +196,12 @@ Downloads the user's entire archive as a ZIP file.
 - Partial downloads are automatically re-downloaded and overwritten on the next run
 - No risk of corrupted files - you always get complete audio files
 
+**Live Progress & Token Refresh:**
+- While a run is going, the page shows the current page, songs scanned, downloaded / failed / skipped, the song being downloaded, speed, and how long the token has left
+- If Suno rejects the token mid-run, the run pauses (up to 30 minutes, `TOKEN_WAIT_MS`) and the page asks for a fresh token, then continues from the same page
+- Reloading the page and entering your username reconnects to a run that is still going
+- Before starting, the page shows how many songs are archived and whether the last run stopped early
+
 **Full Sync Mode:**
 - Disables smart pagination and fetches all pages from Suno
 - Automatically enabled on first run (empty database)

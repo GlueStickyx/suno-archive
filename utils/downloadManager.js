@@ -3,7 +3,7 @@ import path from 'path';
 import fetch from 'node-fetch';
 
 export class DownloadManager {
-  constructor({ dataDir, username, cookie, logger, concurrency = 3, maxRetries = 3, rateLimitMs = 1000, limit = null, format = 'mp3', existingIds = new Set(), db = null, fullSync = false, verifyFiles = false, dlDir = null }) {
+  constructor({ dataDir, username, cookie, logger, concurrency = 3, maxRetries = 3, rateLimitMs = 1000, limit = null, format = 'mp3', existingIds = new Set(), db = null, fullSync = false, verifyFiles = false, dlDir = null, onProgress = null, tokenWaitMs = 30 * 60 * 1000 }) {
     this.dataDir = dataDir;
     this.username = username;
     this.cookie = cookie;
@@ -20,13 +20,21 @@ export class DownloadManager {
     this.dlDir = dlDir; // Download directory for filesystem checks
     this.filesOnDisk = null; // Map of clip id -> formats on disk, built when verifyFiles is on
     this.attempted = 0; // Clips queued for download this run, for the limit
+    this.onProgress = onProgress; // Called with getProgress() whenever something changes
+    this.tokenWaitMs = tokenWaitMs; // How long to wait for a fresh token before giving up
+    this.newToken = null; // Set by supplyToken() while waiting
 
     this.progress = {
       total: 0,
       downloaded: 0,
       failed: 0,
       skipped: 0,
-      status: 'idle'
+      status: 'idle',
+      phase: 'starting', // starting, retrying_failed, listing, waiting_for_token, done
+      page: 0,
+      startPage: 0,
+      listed: 0,
+      currentTrack: null
     };
 
     this.errors = [];
@@ -48,6 +56,8 @@ export class DownloadManager {
 
     let page = startPage;
     let listed = 0;
+    this.progress.startPage = startPage;
+    this.setPhase('listing');
     let consecutiveExistingPages = 0;
     const EARLY_STOP_THRESHOLD = 2; // Stop after 2 consecutive pages of all-existing content
 
@@ -63,6 +73,9 @@ export class DownloadManager {
         await this.sleep(2000); // 2 seconds between page requests to avoid rate limits
       }
 
+      this.progress.page = page;
+      this.report();
+
       const url = `https://studio-api.prod.suno.com/api/feed/v2?hide_disliked=false&hide_gen_stems=true&hide_studio_clips=true&page=${page}`;
 
       const res = await this.retryFetch(url, {
@@ -75,6 +88,8 @@ export class DownloadManager {
       if (!res.ok) {
         const text = await res.text();
         if (res.status === 401 || res.status === 403) {
+          // Pause and let the user paste a fresh token instead of ending the run
+          if (await this.waitForToken(page)) continue;
           throw new Error(`Suno rejected the token on page ${page} (HTTP ${res.status}). Tokens expire - paste a fresh one and run again. Progress is saved and the next run resumes near page ${page}.`);
         }
         throw new Error(`Failed to fetch library (page ${page}): ${res.status} ${res.statusText}\n${text}`);
@@ -95,10 +110,13 @@ export class DownloadManager {
 
       if (clips.length === 0) {
         this.logger.info(`[${this.username}] Reached end of library at page ${page} (${listed} clips listed this run)`);
+        this.setPhase('done');
         return { reachedEnd: true, listed, lastPage: page };
       }
 
       listed += clips.length;
+      this.progress.listed = listed;
+      this.report();
 
       // With verifyFiles, already-archived clips are checked on disk too
       const newClips = clips.filter(c => !this.existingIds.has(c.id));
@@ -125,6 +143,7 @@ export class DownloadManager {
           consecutiveExistingPages++;
           if (consecutiveExistingPages >= EARLY_STOP_THRESHOLD) {
             this.logger.info(`[${this.username}] Early stop: ${EARLY_STOP_THRESHOLD} consecutive pages of existing content`);
+            this.setPhase('done');
             return { reachedEnd: true, listed, lastPage: page };
           }
         } else {
@@ -140,6 +159,7 @@ export class DownloadManager {
     if (pending.length === 0) return;
 
     this.logger.info(`[${this.username}] Retrying ${pending.length} clips that failed in earlier runs`);
+    this.setPhase('retrying_failed');
     this.progress.total += pending.length;
     await this.downloadBatch(pending, this.dlDir);
   }
@@ -157,6 +177,39 @@ export class DownloadManager {
       this.filesOnDisk.get(id).add(fmt);
     }
     this.logger.info(`[${this.username}] Found files for ${this.filesOnDisk.size} clips on disk`);
+  }
+
+  // Wait for supplyToken() to be called. Returns true if a new token arrived.
+  async waitForToken(page) {
+    this.logger.warn(`[${this.username}] Token rejected on page ${page}, waiting up to ${Math.round(this.tokenWaitMs / 60000)} min for a fresh token`);
+    this.newToken = null;
+    this.setPhase('waiting_for_token');
+
+    const deadline = Date.now() + this.tokenWaitMs;
+    while (!this.newToken && Date.now() < deadline) {
+      await this.sleep(1000);
+    }
+
+    if (!this.newToken) return false;
+
+    this.cookie = this.newToken;
+    this.newToken = null;
+    this.logger.info(`[${this.username}] Received a fresh token, continuing from page ${page}`);
+    this.setPhase('listing');
+    return true;
+  }
+
+  supplyToken(token) {
+    this.newToken = token;
+  }
+
+  setPhase(phase) {
+    this.progress.phase = phase;
+    this.report();
+  }
+
+  report() {
+    if (this.onProgress) this.onProgress(this.getProgress());
   }
 
   async retryFetch(url, options, attempt = 1) {
@@ -203,6 +256,7 @@ export class DownloadManager {
       .slice(0, 100);                   // Limit length
 
     const fileBase = `${safeTitle} - ${item.id}`;
+    this.progress.currentTrack = item.title || item.id;
 
     // Determine which formats to download
     const formats = this.format === 'both' ? ['mp3', 'wav'] : [this.format];
@@ -294,6 +348,7 @@ export class DownloadManager {
       const item = queue.shift();
       if (item) {
         const success = await this.downloadItem(item, dlDir);
+        this.report();
 
         // Write to database immediately after each download attempt
         if (this.db) {
